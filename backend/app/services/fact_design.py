@@ -124,6 +124,10 @@ class FactDesignService(BaseModuleService):
             dims = str(row.get("关联维度", "")).split(".")
             dim_matrix[fact_name] = [d for d in dims if d]
         base["dimension_association_matrix"] = dim_matrix
+
+        # 代理键批次归属对照：与代理键模块共用同一份分配批次记录，
+        # 事实外键按修正后的批次归属校验，重叠编号标明归属批次
+        base["key_batch_overlaps"] = store.key_batches.overlap_keys()
         return base
 
 

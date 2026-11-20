@@ -160,6 +160,10 @@ def fact_partition_write(
     partition_field: str,
     dim_fk_fields: dict[str, str],
     store: Any,
+    *,
+    sk_fk_fields: dict[str, str] | None = None,
+    natural_key_field: str | None = None,
+    batch_field: str | None = None,
 ) -> dict[str, Any]:
     """向事实表写入记录，同时校验维度外键完整性。
 
@@ -169,11 +173,20 @@ def fact_partition_write(
         partition_field: 分区字段名
         dim_fk_fields: 维度外键映射 {field_name: dim_key}
         store: 数据仓库实例
+        sk_fk_fields: 代理键外键映射 {field_name: dim_code}，按分配批次校验归属
+        natural_key_field: 自然键字段名，重关联时结合原分配批次定位受影响记录
+        batch_field: 记录原分配批次 batch_id 的字段名
 
     Returns:
-        {wrote: int, violations: list, partitions: dict}
+        {wrote, violations, partitions, key_attributions, reassociated}
     """
-    result: dict[str, Any] = {"wrote": 0, "violations": [], "partitions": {}}
+    result: dict[str, Any] = {
+        "wrote": 0,
+        "violations": [],
+        "partitions": {},
+        "key_attributions": [],
+        "reassociated": [],
+    }
 
     # 收集维度有效 keys
     dim_table = store.rows("dim_definition")
@@ -189,7 +202,7 @@ def fact_partition_write(
     fact_table = store.rows("fact_design")
     max_id = max((int(r.get("id", 0)) for r in fact_table), default=0)
 
-    for rec in records:
+    for index, rec in enumerate(records):
         violations = []
         for field_name, dim_key in dim_fk_fields.items():
             fk_value = str(rec.get(field_name, ""))
@@ -200,6 +213,13 @@ def fact_partition_write(
                     "value": fk_value,
                     "reason": f"维度 {dim_key} 不存在有效键值 {fk_value}",
                 })
+
+        # 代理键外键：按分配批次校验归属，历史重叠编号结合原批次与自然键重关联
+        if sk_fk_fields:
+            _validate_sk_foreign_keys(
+                rec, index, sk_fk_fields, natural_key_field, batch_field,
+                store, violations, result,
+            )
 
         if violations:
             result["violations"].extend(violations)
@@ -222,6 +242,116 @@ def fact_partition_write(
         result["wrote"] += 1
 
     return result
+
+
+def _validate_sk_foreign_keys(
+    rec: dict[str, Any],
+    index: int,
+    sk_fk_fields: dict[str, str],
+    natural_key_field: str | None,
+    batch_field: str | None,
+    store: Any,
+    violations: list[dict[str, Any]],
+    result: dict[str, Any],
+) -> None:
+    """按分配批次校验代理键外键归属，并对历史重叠编号的记录重关联。
+
+    - 编号必须落在某批次修正后的有效键域内（按实际步长核对首键/末键）；
+    - 同一边界编号被两个批次引用时归属唯一批次；行记录的原批次失去该
+      编号时，结合原批次与自然键换发本批次内的有效键，避免只按编号
+      改错另一批已写入的事实；
+    - 编号在批次内只能确认给一个成员，避免有效编号指向多个成员。
+    """
+    registry = store.key_batches
+    natural_key = ""
+    if natural_key_field:
+        natural_key = str(rec.get(natural_key_field, "")).strip()
+    if not natural_key:
+        natural_key = f"row#{index}"
+
+    for field_name, dim_code in sk_fk_fields.items():
+        raw_value = str(rec.get(field_name, "")).strip()
+        if not raw_value:
+            continue
+        try:
+            value = int(raw_value)
+        except ValueError:
+            violations.append({
+                "field": field_name,
+                "value": raw_value,
+                "reason": f"维度 {dim_code} 的代理键 {raw_value} 不是有效编号",
+            })
+            continue
+
+        owner = registry.attribute(dim_code, value)
+        if owner is None:
+            violations.append({
+                "field": field_name,
+                "value": raw_value,
+                "reason": f"维度 {dim_code} 的编号 {value} 不在任何分配批次的有效键域内",
+            })
+            continue
+
+        refs = registry.referencing_batches(dim_code, value)
+        row_batch_id = str(rec.get(batch_field, "")).strip() if batch_field else ""
+
+        if row_batch_id and row_batch_id != owner["batch_id"]:
+            ref_ids = {b["batch_id"] for b in refs}
+            if row_batch_id not in ref_ids:
+                violations.append({
+                    "field": field_name,
+                    "value": raw_value,
+                    "reason": f"编号 {value} 不属于行记录的原分配批次 {row_batch_id}",
+                })
+                continue
+            # 历史重叠编号：原批次失去该编号，结合原批次与自然键重关联
+            new_key = _reassociate_key(registry, row_batch_id, value, natural_key)
+            if new_key is None:
+                violations.append({
+                    "field": field_name,
+                    "value": raw_value,
+                    "reason": f"原分配批次 {row_batch_id} 键域已耗尽，无法为成员 {natural_key} 换发新键",
+                })
+                continue
+            rec[field_name] = str(new_key)
+            result["reassociated"].append({
+                "row": natural_key,
+                "field": field_name,
+                "dim_code": dim_code,
+                "batch_id": row_batch_id,
+                "old_key": value,
+                "new_key": new_key,
+                "owner_batch": owner["batch_id"],
+            })
+            continue
+
+        ok, reason = registry.assign(owner["batch_id"], value, natural_key)
+        if not ok:
+            violations.append({
+                "field": field_name,
+                "value": raw_value,
+                "reason": f"维度 {dim_code} 编号 {value} 归属冲突：{reason}",
+            })
+            continue
+        result["key_attributions"].append({
+            "row": natural_key,
+            "field": field_name,
+            "dim_code": dim_code,
+            "key": value,
+            "batch_id": owner["batch_id"],
+            "shared_refs": [b["batch_id"] for b in refs if b["batch_id"] != owner["batch_id"]],
+        })
+
+
+def _reassociate_key(registry: Any, batch_id: str, old_value: int,
+                     natural_key: str) -> int | None:
+    """为受影响成员在原批次有效键域内换发新键，并回收旧编号的确认关系。"""
+    registry.release(batch_id, old_value, natural_key)
+    new_key = registry.next_free_key(batch_id)
+    if new_key is None:
+        return None
+    ok, _ = registry.assign(batch_id, new_key, natural_key)
+    return new_key if ok else None
 
 
 # ---------------------------------------------------------------------------

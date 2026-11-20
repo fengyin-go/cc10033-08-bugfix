@@ -316,6 +316,203 @@ class ArtifactRegistry:
         return {"total": len(self._artifacts), "by_type": by_type, "by_module": by_module}
 
 
+def _ap_values_in(batch: dict[str, Any], lo: int, hi: int):
+    """枚举批次原始记录键道在闭区间 [lo, hi] 内的编号。"""
+    start, end, step = int(batch["start"]), int(batch["end"]), int(batch["step"])
+    lo = max(lo, start)
+    hi = min(hi, end)
+    if lo > hi or step <= 0:
+        return
+    offset = (lo - start + step - 1) // step
+    value = start + offset * step
+    while value <= hi:
+        yield value
+        value += step
+
+
+def _range_intersection(a: dict[str, Any], b: dict[str, Any]) -> list[int]:
+    """两个批次原始记录区间共同引用的编号（按各自步长对齐）。"""
+    lo = max(int(a["start"]), int(b["start"]))
+    hi = min(int(a["end"]), int(b["end"]))
+    if lo > hi:
+        return []
+    return sorted(set(_ap_values_in(a, lo, hi)) & set(_ap_values_in(b, lo, hi)))
+
+
+class KeyBatchRegistry:
+    """代理键键段批次登记册：记录每次键段分配批次，判定编号归属并处置历史重叠。
+
+    - 每个批次的有效键域为闭区间 [首键, 首键 + (可分配总数 - 1) * 步长]，
+      编号按步长对齐；
+    - 历史缺陷批次的记录末键可能多出一个步长，归属判定以修正后的有效键域为准；
+    - 同一边界编号被两个批次引用时，只有有效键域覆盖它的批次拥有该编号，
+      另一批次已写入的事实需结合原分配批次与自然键重关联；
+    - 批次内编号确认给唯一成员（自然键），不同成员的键不能共享。
+    """
+
+    def __init__(self) -> None:
+        self._batches: list[dict[str, Any]] = []
+        # batch_id -> {编号: 自然键}，批次内编号已确认给哪个成员
+        self._assignments: dict[str, dict[int, str]] = {}
+
+    # ---------- 批次登记 ----------
+
+    def register(self, *, key_id: int, key_name: str, dim_code: str,
+                 start: int, end: int, step: int, count: int) -> dict[str, Any]:
+        """登记一个分配批次，批次号在同一键值定义下递增。"""
+        batch_no = 1 + sum(1 for b in self._batches if b["key_id"] == key_id)
+        batch = {
+            "batch_id": f"sk{key_id}-b{batch_no}",
+            "key_id": key_id,
+            "key_name": key_name,
+            "dim_code": dim_code,
+            "batch_no": batch_no,
+            "start": int(start),
+            "end": int(end),
+            "step": int(step),
+            "count": int(count),
+            "allocated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self._batches.append(batch)
+        return batch
+
+    def clear(self, key_id: int) -> int:
+        """重置键值时清除该键值定义的全部批次与成员归属记录，返回清除批次数。"""
+        removed = [b for b in self._batches if b["key_id"] == key_id]
+        if removed:
+            self._batches = [b for b in self._batches if b["key_id"] != key_id]
+            for batch in removed:
+                self._assignments.pop(batch["batch_id"], None)
+        return len(removed)
+
+    def get(self, batch_id: str) -> dict[str, Any] | None:
+        for batch in self._batches:
+            if batch["batch_id"] == batch_id:
+                return batch
+        return None
+
+    def batches_for(self, key_id: int | None = None,
+                    dim_code: str | None = None) -> list[dict[str, Any]]:
+        """按键值定义或维度编码查询批次，按批次号排序。"""
+        rows = list(self._batches)
+        if key_id is not None:
+            rows = [b for b in rows if b["key_id"] == key_id]
+        if dim_code is not None:
+            rows = [b for b in rows if b["dim_code"] == dim_code]
+        return sorted(rows, key=lambda b: (b["key_id"], b["batch_no"]))
+
+    # ---------- 端点与归属判定 ----------
+
+    @staticmethod
+    def valid_end(batch: dict[str, Any]) -> int:
+        """修正后的末键：首键 + (可分配总数 - 1) * 步长。"""
+        return int(batch["start"]) + (int(batch["count"]) - 1) * int(batch["step"])
+
+    def valid_range(self, batch: dict[str, Any]) -> tuple[int, int, int]:
+        """批次的 (首键, 修正末键, 步长)。"""
+        return int(batch["start"]), self.valid_end(batch), int(batch["step"])
+
+    def owns(self, batch: dict[str, Any], value: int) -> bool:
+        """编号是否落在批次修正后的有效键域内（闭区间且按步长对齐）。"""
+        start, end, step = self.valid_range(batch)
+        return step > 0 and start <= value <= end and (value - start) % step == 0
+
+    def references(self, batch: dict[str, Any], value: int) -> bool:
+        """编号是否落在批次原始记录区间内（含历史缺陷多出的边界编号）。"""
+        start, end, step = int(batch["start"]), int(batch["end"]), int(batch["step"])
+        return step > 0 and start <= value <= end and (value - start) % step == 0
+
+    def referencing_batches(self, dim_code: str, value: int) -> list[dict[str, Any]]:
+        """原始记录引用了该编号的全部批次，按批次号排序。"""
+        return [b for b in self.batches_for(dim_code=dim_code) if self.references(b, value)]
+
+    def attribute(self, dim_code: str, value: int) -> dict[str, Any] | None:
+        """编号归属：修正后有效键域内持有该编号的唯一批次。
+
+        同一边界编号被两个批次引用时，仅有效键域覆盖它的批次拥有该编号，
+        保证有效编号不会同时指向多个批次。
+        """
+        owners = [b for b in self.batches_for(dim_code=dim_code) if self.owns(b, value)]
+        if not owners:
+            return None
+        return owners[0]
+
+    def overlap_keys(self, dim_code: str | None = None) -> list[dict[str, Any]]:
+        """检测被多个批次原始记录同时引用的编号（历史重叠边界）。
+
+        返回每个重叠编号、引用它的批次列表以及修正后的归属批次。
+        """
+        batches = self.batches_for(dim_code=dim_code)
+        result: list[dict[str, Any]] = []
+        for dim in sorted({b["dim_code"] for b in batches}):
+            dim_batches = [b for b in batches if b["dim_code"] == dim]
+            hits: dict[int, set[str]] = {}
+            for index, batch in enumerate(dim_batches):
+                for other in dim_batches[index + 1:]:
+                    for value in _range_intersection(batch, other):
+                        hits.setdefault(value, set()).update(
+                            (batch["batch_id"], other["batch_id"]))
+            for value in sorted(hits):
+                owner = self.attribute(dim, value)
+                result.append({
+                    "dim_code": dim,
+                    "value": value,
+                    "referenced_by": sorted(hits[value]),
+                    "owner_batch": owner["batch_id"] if owner else None,
+                })
+        return result
+
+    # ---------- 成员归属 ----------
+
+    def assign(self, batch_id: str, value: int, natural_key: str) -> tuple[bool, str]:
+        """在批次内把编号确认给指定自然键成员。
+
+        编号必须落在该批次修正后的有效键域内；同一批次内编号已确认给
+        其他成员时拒绝——不同成员的键不能共享。
+        """
+        batch = self.get(batch_id)
+        if batch is None:
+            return False, f"分配批次 {batch_id} 不存在"
+        if not self.owns(batch, value):
+            return False, f"编号 {value} 不在批次 {batch_id} 的有效键域内"
+        members = self._assignments.setdefault(batch_id, {})
+        holder = members.get(value)
+        if holder is not None and holder != natural_key:
+            return False, f"编号 {value} 已确认给成员 {holder}，不能共享"
+        members[value] = natural_key
+        return True, ""
+
+    def holder(self, batch_id: str, value: int) -> str | None:
+        """编号在该批次内确认给的成员自然键。"""
+        return self._assignments.get(batch_id, {}).get(value)
+
+    def release(self, batch_id: str, value: int, natural_key: str) -> bool:
+        """解除批次内编号与成员的确认关系（重关联时回收旧编号）。"""
+        members = self._assignments.get(batch_id, {})
+        if members.get(value) == natural_key:
+            del members[value]
+            return True
+        return False
+
+    def next_free_key(self, batch_id: str) -> int | None:
+        """批次有效键域内第一个未确认的编号，耗尽时返回 None。"""
+        batch = self.get(batch_id)
+        if batch is None:
+            return None
+        start, end, step = self.valid_range(batch)
+        used = self._assignments.get(batch_id, {})
+        value = start
+        while value <= end:
+            if value not in used:
+                return value
+            value += step
+        return None
+
+    def assignments(self, batch_id: str) -> dict[int, str]:
+        """批次内已确认的 编号 -> 自然键 映射。"""
+        return dict(self._assignments.get(batch_id, {}))
+
+
 class Store:
     def __init__(self) -> None:
         self._tables: dict[str, list[dict[str, Any]]] = {
@@ -325,6 +522,7 @@ class Store:
         self.recovery = FailureRecovery()
         self.snapshot = SnapshotEngine()
         self.artifacts = ArtifactRegistry()
+        self.key_batches = KeyBatchRegistry()
 
     def module_names(self) -> list[str]:
         return sorted(self._tables)
